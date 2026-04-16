@@ -1,0 +1,18 @@
+version: '3.8'
+
+services:
+  cfao-monitor:
+    build: .
+    container_name: cfao-process-monitor
+    restart: unless-stopped
+    env_file:
+      - .env
+    volumes:
+      - ./data:/app/data
+      - ./logs:/app/logs
+    networks:
+      - cfao-network
+
+networks:
+  cfao-network:
+    driver: bridge
