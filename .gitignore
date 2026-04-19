@@ -29,3 +29,6 @@ debug_*.png
 
 # State files
 state.json
+browser_session.json
+reports/
+screenshots/
