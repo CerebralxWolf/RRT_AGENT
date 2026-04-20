@@ -9,12 +9,9 @@ detects stuck processes (>20 minutes), and sends email notifications.
 import json
 import logging
 import os
-import smtplib
 import sys
 import time
 from datetime import datetime, timedelta
-from email.mime.multipart import MIMEMultipart
-from email.mime.text import MIMEText
 from typing import Dict, List, Optional
 
 from apscheduler.schedulers.blocking import BlockingScheduler
@@ -27,13 +24,16 @@ from config import Config
 class CFAOProcessMonitor:
     """Main agent class for monitoring CFAO processes"""
 
-    def __init__(self, test_mode=False, skip_email=False):
+    def __init__(self, test_mode=False):
         self.config = Config()
         self.config.validate()
         self.setup_logging()
         self.state = self.load_state()
         self.test_mode = test_mode
-        self.skip_email = skip_email
+
+        # Ensure directories exist
+        os.makedirs(self.config.REPORT_DIR, exist_ok=True)
+        os.makedirs(self.config.SCREENSHOT_DIR, exist_ok=True)
 
     def setup_logging(self):
         """Configure logging to both file and console"""
@@ -113,44 +113,103 @@ class CFAOProcessMonitor:
 
                 # Try to find and fill login form
                 try:
+                    # Wait for form elements to be visible
+                    page.wait_for_selector('input[type="text"], input[name="username"]', timeout=10000)
+
                     # Look for username field
-                    username_field = page.locator('input[type="text"], input[name="username"], input[id="username"]').first
-                    if username_field.count() > 0:
-                        self.logger.info("Found username field, filling credentials...")
-                        username_field.fill(self.config.ORACLE_USERNAME)
+                    username_selectors = ['input[type="text"]', 'input[name="username"]', 'input[id="username"]', '#username']
+                    username_field = None
+                    for selector in username_selectors:
+                        try:
+                            if page.locator(selector).count() > 0:
+                                username_field = page.locator(selector).first
+                                break
+                        except:
+                            continue
 
-                        # Look for password field
-                        password_field = page.locator('input[type="password"], input[name="password"]').first
-                        if password_field.count() > 0:
-                            password_field.fill(self.config.ORACLE_PASSWORD)
-
-                            # Look for submit button
-                            submit_button = page.locator('button[type="submit"], input[type="submit"], button:has-text("Sign In")').first
-                            if submit_button.count() > 0:
-                                self.logger.info("Clicking login button...")
-                                submit_button.click()
-
-                                # Wait for navigation after login
-                                page.wait_for_load_state('networkidle', timeout=self.config.BROWSER_TIMEOUT)
-                                time.sleep(3)  # Wait for any additional redirects
-
-                                # Check if login was successful by verifying we're not on login page anymore
-                                final_url = page.url
-                                if "signin" not in final_url.lower() and "login" not in final_url.lower():
-                                    self.logger.info("Login successful! Now on processes page.")
-                                    return True
-                                else:
-                                    self.logger.error("Login failed - still on login page after submission")
-                                    return False
-                            else:
-                                self.logger.error("Submit button not found")
-                                return False
-                        else:
-                            self.logger.error("Password field not found")
-                            return False
-                    else:
+                    if not username_field:
                         self.logger.error("Username field not found")
                         return False
+
+                    self.logger.info("Found username field, filling credentials...")
+                    username_field.fill(self.config.ORACLE_USERNAME)
+                    time.sleep(1)
+
+                    # Look for password field
+                    password_selectors = ['input[type="password"]', 'input[name="password"]', 'input[id="password"]', '#password']
+                    password_field = None
+                    for selector in password_selectors:
+                        try:
+                            if page.locator(selector).count() > 0:
+                                password_field = page.locator(selector).first
+                                break
+                        except:
+                            continue
+
+                    if not password_field:
+                        self.logger.error("Password field not found")
+                        return False
+
+                    self.logger.info("Found password field, filling credentials...")
+                    password_field.fill(self.config.ORACLE_PASSWORD)
+                    time.sleep(1)
+
+                    # Look for submit button
+                    submit_selectors = ['button[type="submit"]', 'input[type="submit"]', 'button:has-text("Sign In")', 'button:has-text("Login")', '#signin', '#login']
+                    submit_button = None
+                    for selector in submit_selectors:
+                        try:
+                            if page.locator(selector).count() > 0:
+                                submit_button = page.locator(selector).first
+                                break
+                        except:
+                            continue
+
+                    if not submit_button:
+                        self.logger.error("Submit button not found")
+                        return False
+
+                    self.logger.info(f"Found submit button, clicking it...")
+                    submit_button.click()
+
+                    # Wait for navigation after login
+                    page.wait_for_load_state('networkidle', timeout=self.config.BROWSER_TIMEOUT)
+                    time.sleep(5)  # Wait for any additional redirects or 2FA
+
+                    # Check for common post-login elements or URL changes
+                    max_wait = 30  # seconds
+                    for i in range(max_wait):
+                        current_url = page.url
+                        current_title = page.title()
+                        self.logger.debug(f"Waiting for login completion... {i+1}/{max_wait} - URL: {current_url}, Title: {current_title}")
+
+                        # Check if we're no longer on login page
+                        if "signin" not in current_url.lower() and "login" not in current_url.lower():
+                            self.logger.info("Login successful! URL changed away from login page.")
+                            return True
+
+                        # Check if title indicates we're on the application
+                        if "open processes" in current_title.lower() or "cfao" in current_title.lower():
+                            self.logger.info("Login successful! Page title indicates processes page.")
+                            return True
+
+                        # Check for error messages
+                        error_selectors = ['.error', '.alert', '[class*="error"]', '[class*="alert"]']
+                        for selector in error_selectors:
+                            try:
+                                if page.locator(selector).count() > 0:
+                                    error_text = page.locator(selector).first.text_content()
+                                    if error_text.strip():
+                                        self.logger.error(f"Login error detected: {error_text}")
+                                        return False
+                            except:
+                                continue
+
+                        time.sleep(1)
+
+                    # If we get here, login may have succeeded but page didn't change as expected
+                    self.logger.warning("Login completion uncertain - proceeding anyway")
+                    return True
 
                 except Exception as e:
                     self.logger.error(f"Error during login form interaction: {e}")
@@ -220,11 +279,11 @@ class CFAOProcessMonitor:
             self.logger.info(f"Processes page URL: {page.url}")
             self.logger.info(f"Page title: {page.title()}")
 
-            try:
-                page.screenshot(path="debug_processes_page.png")
-                self.logger.info("Screenshot saved as debug_processes_page.png")
-            except Exception as e:
-                self.logger.warning(f"Could not take screenshot: {e}")
+            # Check if we're actually on a processes page
+            page_text = page.locator('body').text_content().lower()
+            if 'process' not in page_text and 'open' not in page_text:
+                self.logger.warning("Page does not appear to contain process information")
+                return processes
 
             # Look for the processes table - try multiple selectors
             table_selectors = [
@@ -232,34 +291,63 @@ class CFAOProcessMonitor:
                 '.table',
                 '#processesTable',
                 'table[class*="process" i]',
-                'table:has(th:contains("Process ID"))'
+                'table:has(th:contains("Process ID"))',
+                'table:has(th:contains("ID"))'
             ]
 
             table = None
             for selector in table_selectors:
                 try:
-                    if page.locator(selector).count() > 0:
-                        table = page.locator(selector).first
+                    tables = page.locator(selector).all()
+                    self.logger.info(f"Found {len(tables)} table(s) with selector '{selector}'")
+                    if len(tables) > 0:
+                        table = tables[0]
+                        self.logger.info(f"Using table with selector '{selector}'")
                         break
-                except:
+                except Exception as e:
+                    self.logger.debug(f"Selector '{selector}' failed: {e}")
                     continue
 
             if not table:
-                self.logger.warning("No processes table found")
+                self.logger.warning("No processes table found on main page, checking frames...")
+                # Check frames
+                frames = page.frames
+                self.logger.info(f"Found {len(frames)} iframe(s) on the page")
+                for i, frame in enumerate(frames):
+                    try:
+                        frame_tables = frame.locator('table').all()
+                        self.logger.info(f"Frame {i}: Found {len(frame_tables)} table(s)")
+                        if len(frame_tables) > 0:
+                            # Check if this frame has process data
+                            frame_text = frame.locator('body').text_content().lower()
+                            if 'process' in frame_text:
+                                table = frame_tables[0]
+                                self.logger.info(f"Using table from frame {i}")
+                                break
+                    except Exception as e:
+                        self.logger.debug(f"Frame {i} check failed: {e}")
+                        continue
+
+            if not table:
+                self.logger.warning("No processes table found in any frame")
                 return processes
 
             # Extract table rows (skip header)
             rows = table.locator('tbody tr, tr').all()
+            self.logger.info(f"Found {len(rows)} total rows in table")
+
             if len(rows) <= 1:  # No data rows
                 self.logger.info("No process rows found in table")
                 return processes
 
-            self.logger.info(f"Found {len(rows)-1} process rows")
+            self.logger.info(f"Processing {len(rows)-1} data rows")
 
-            for row in rows[1:]:  # Skip header row
+            for row_idx, row in enumerate(rows[1:], 1):  # Skip header row
                 try:
                     cells = row.locator('td').all()
+                    self.logger.debug(f"Row {row_idx}: Found {len(cells)} cells")
                     if len(cells) < 6:  # Minimum expected columns
+                        self.logger.debug(f"Row {row_idx}: Skipping - not enough cells")
                         continue
 
                     process_data = {
@@ -272,12 +360,17 @@ class CFAOProcessMonitor:
                         'locks': cells[6].text_content().strip() if len(cells) > 6 else ''
                     }
 
+                    self.logger.debug(f"Row {row_idx}: Process ID = '{process_data['process_id']}'")
+
                     # Only add if we have at least a process ID
                     if process_data['process_id']:
                         processes.append(process_data)
+                        self.logger.debug(f"Added process: {process_data['process_id']}")
+                    else:
+                        self.logger.debug(f"Skipped row {row_idx} - no process ID")
 
                 except Exception as e:
-                    self.logger.warning(f"Failed to extract data from row: {e}")
+                    self.logger.warning(f"Failed to extract data from row {row_idx}: {e}")
                     continue
 
             self.logger.info(f"Successfully extracted {len(processes)} processes")
@@ -286,35 +379,6 @@ class CFAOProcessMonitor:
         except Exception as e:
             self.logger.error(f"Failed to extract processes data: {e}")
             return processes
-
-    def send_email(self, subject: str, body: str) -> bool:
-        """Send email notification"""
-        # For testing, skip actual email sending
-        if self.skip_email:
-            self.logger.info(f"SKIP_EMAIL is set - would send email: {subject}")
-            return True
-
-        try:
-            msg = MIMEMultipart()
-            msg['From'] = self.config.EMAIL_FROM
-            msg['To'] = self.config.EMAIL_TO
-            msg['Subject'] = subject
-
-            msg.attach(MIMEText(body, 'plain'))
-
-            server = smtplib.SMTP(self.config.SMTP_HOST, self.config.SMTP_PORT)
-            server.starttls()
-            server.login(self.config.SMTP_USER, self.config.SMTP_PASSWORD)
-            text = msg.as_string()
-            server.sendmail(self.config.EMAIL_FROM, self.config.EMAIL_TO, text)
-            server.quit()
-
-            self.logger.info(f"Email sent successfully: {subject}")
-            return True
-
-        except Exception as e:
-            self.logger.error(f"Failed to send email: {e}")
-            return False
 
     def check_for_stuck_processes(self, processes: List[Dict]) -> List[Dict]:
         """Check for processes running longer than threshold"""
@@ -337,13 +401,17 @@ class CFAOProcessMonitor:
         return stuck_processes
 
     def send_stuck_process_alert(self, stuck_processes: List[Dict]):
-        """Send alert for stuck processes"""
+        """Save alert report for stuck processes"""
         if not stuck_processes:
             return
 
-        subject = f"ALERT: {len(stuck_processes)} CFAO Process(es) Stuck"
+        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        report_filename = f"cfaoprocesses_alert_{timestamp}.txt"
+        report_path = os.path.join(self.config.REPORT_DIR, report_filename)
 
         body_lines = [
+            f"ALERT: {len(stuck_processes)} CFAO Process(es) Stuck",
+            "",
             "The following CFAO processes have been running for more than 20 minutes:",
             "",
         ]
@@ -365,24 +433,127 @@ class CFAOProcessMonitor:
         ])
 
         body = "\n".join(body_lines)
-        self.send_email(subject, body)
+
+        try:
+            with open(report_path, 'w', encoding='utf-8') as f:
+                f.write(body)
+            self.logger.warning(f"Alert report saved: {report_path}")
+        except Exception as e:
+            self.logger.error(f"Failed to save alert report: {e}")
 
     def send_all_clear_notification(self):
-        """Send all-clear notification"""
+        """Save all-clear report"""
         now = datetime.now()
-        subject = "CFAO Processes Status: All Clear"
+        timestamp = now.strftime('%Y%m%d_%H%M%S')
+        report_filename = f"cfaoprocesses_allclear_{timestamp}.txt"
+        report_path = os.path.join(self.config.REPORT_DIR, report_filename)
 
         body = "\n".join([
-            "All CFAO open processes are running normally (≤20 minutes).",
+            "CFAO Processes Status: All Clear",
+            "",
+            "All CFAO open processes are running normally (<=20 minutes).",
             "",
             f"Checked at: {now.strftime('%Y-%m-%d %H:%M:%S')}",
             "",
-            "Next all-clear notification will be sent in 1 hour if status remains clear."
+            "Next all-clear report will be saved in 1 hour if status remains clear."
         ])
 
-        if self.send_email(subject, body):
+        try:
+            with open(report_path, 'w', encoding='utf-8') as f:
+                f.write(body)
+            self.logger.info(f"All-clear report saved: {report_path}")
             self.state['last_all_clear_timestamp'] = now.isoformat()
             self.save_state()
+        except Exception as e:
+            self.logger.error(f"Failed to save all-clear report: {e}")
+
+    def save_monitoring_report(self, page: Page, processes: List[Dict], stuck_processes: List[Dict]):
+        """Save a general monitoring report and screenshot"""
+        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+
+        # Save screenshot
+        screenshot_filename = f"cfaoprocesses_{timestamp}.png"
+        screenshot_path = os.path.join(self.config.SCREENSHOT_DIR, screenshot_filename)
+
+        try:
+            page.screenshot(path=screenshot_path)
+            self.logger.info(f"Screenshot saved: {screenshot_path}")
+        except Exception as e:
+            self.logger.error(f"Failed to save screenshot: {e}")
+
+        # Save report
+        report_filename = f"cfaoprocesses_report_{timestamp}.txt"
+        report_path = os.path.join(self.config.REPORT_DIR, report_filename)
+
+        report_lines = [
+            "CFAO Process Monitor Report",
+            f"Timestamp: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+            f"Process URL: {page.url}",
+            f"Total Processes: {len(processes)}",
+            f"Stuck Processes: {len(stuck_processes)}",
+            "",
+            f"Screenshot: {screenshot_path}",
+            "",
+        ]
+
+        if stuck_processes:
+            report_lines.append("Stuck Processes:")
+            for process in stuck_processes:
+                report_lines.extend([
+                    f"  ID: {process['process_id']}",
+                    f"  Description: {process['description']}",
+                    f"  Time: {process['elapsed_minutes']} minutes",
+                    f"  Server: {process['server']}",
+                    "",
+                ])
+        else:
+            report_lines.append("No stuck processes detected.")
+
+        try:
+            with open(report_path, 'w', encoding='utf-8') as f:
+                f.write("\n".join(report_lines))
+            self.logger.info(f"Report saved: {report_path}")
+        except Exception as e:
+            self.logger.error(f"Failed to save report: {e}")
+
+    def save_test_report(self, processes: List[Dict], stuck_processes: List[Dict]):
+        """Save a test monitoring report (without screenshot)"""
+        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+
+        # Save report
+        report_filename = f"cfaoprocesses_report_{timestamp}.txt"
+        report_path = os.path.join(self.config.REPORT_DIR, report_filename)
+
+        report_lines = [
+            "CFAO Process Monitor Report (TEST MODE)",
+            f"Timestamp: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+            "Process URL: N/A (test mode)",
+            f"Total Processes: {len(processes)}",
+            f"Stuck Processes: {len(stuck_processes)}",
+            "",
+            "Screenshot: N/A (test mode)",
+            "",
+        ]
+
+        if stuck_processes:
+            report_lines.append("Stuck Processes:")
+            for process in stuck_processes:
+                report_lines.extend([
+                    f"  ID: {process['process_id']}",
+                    f"  Description: {process['description']}",
+                    f"  Time: {process['elapsed_minutes']} minutes",
+                    f"  Server: {process['server']}",
+                    "",
+                ])
+        else:
+            report_lines.append("No stuck processes detected.")
+
+        try:
+            with open(report_path, 'w', encoding='utf-8') as f:
+                f.write("\n".join(report_lines))
+            self.logger.info(f"Report saved: {report_path}")
+        except Exception as e:
+            self.logger.error(f"Failed to save report: {e}")
 
     def should_send_all_clear(self) -> bool:
         """Check if all-clear notification should be sent"""
@@ -430,12 +601,15 @@ class CFAOProcessMonitor:
                 # Step 4: Check for stuck processes
                 stuck_processes = self.check_for_stuck_processes(processes)
 
+                # Step 5: Save monitoring report and screenshot
+                self.save_monitoring_report(page, processes, stuck_processes)
+
                 if stuck_processes:
-                    # Step 5a: Send alert for stuck processes
+                    # Step 6a: Send alert for stuck processes
                     self.logger.warning(f"Found {len(stuck_processes)} stuck processes")
                     self.send_stuck_process_alert(stuck_processes)
                 else:
-                    # Step 5b: Check if all-clear notification should be sent
+                    # Step 6b: Check if all-clear notification should be sent
                     if self.should_send_all_clear():
                         self.logger.info("Sending all-clear notification")
                         self.send_all_clear_notification()
@@ -465,12 +639,15 @@ class CFAOProcessMonitor:
         # Step 4: Check for stuck processes
         stuck_processes = self.check_for_stuck_processes(processes)
 
+        # Step 5: Save monitoring report (without page)
+        self.save_test_report(processes, stuck_processes)
+
         if stuck_processes:
-            # Step 5a: Send alert for stuck processes
+            # Step 6a: Send alert for stuck processes
             self.logger.warning(f"Found {len(stuck_processes)} stuck processes")
             self.send_stuck_process_alert(stuck_processes)
         else:
-            # Step 5b: Check if all-clear notification should be sent
+            # Step 6b: Check if all-clear notification should be sent
             if self.should_send_all_clear():
                 self.logger.info("Sending all-clear notification")
                 self.send_all_clear_notification()
@@ -579,17 +756,12 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description='CFAO Process Monitor Agent')
     parser.add_argument('--once', action='store_true', help='Run a single monitoring cycle')
     parser.add_argument('--test', action='store_true', help='Run in test mode with mock data')
-    parser.add_argument('--skip-email', action='store_true', help='Skip sending emails')
-    parser.add_argument('--send-test-email', action='store_true', help='Send a test email')
 
     args = parser.parse_args()
 
-    agent = CFAOProcessMonitor(test_mode=args.test, skip_email=args.skip_email)
+    agent = CFAOProcessMonitor(test_mode=args.test)
 
-    if args.send_test_email:
-        agent.send_email("Test Email from CFAO Agent", "This is a test email to verify Outlook SMTP configuration.")
-        print("Test email sent.")
-    elif args.once:
+    if args.once:
         agent.run_once()
     else:
         agent.run_scheduled()

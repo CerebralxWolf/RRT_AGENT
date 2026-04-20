@@ -28,27 +28,13 @@ def check_directory_exists(dirpath, description):
         return False
 
 def check_env_file():
-    """Check if .env file exists and has required variables"""
+    """Check if .env file exists"""
     env_file = '.env'
     if not os.path.exists(env_file):
         print(f"✗ .env file missing. Copy .env.example to .env and configure.")
         return False
 
-    required_vars = ['SMTP_HOST', 'SMTP_USER', 'SMTP_PASSWORD']
-    missing_vars = []
-
-    with open(env_file, 'r') as f:
-        content = f.read()
-
-    for var in required_vars:
-        if f'{var}=' not in content:
-            missing_vars.append(var)
-
-    if missing_vars:
-        print(f"✗ Missing required environment variables: {', '.join(missing_vars)}")
-        return False
-
-    print("✓ .env file configured with required variables")
+    print("✓ .env file exists")
     return True
 
 def check_python_imports():
